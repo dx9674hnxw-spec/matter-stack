@@ -38,8 +38,10 @@ BRIDGE_PUBLIC_URL = os.environ.get("BRIDGE_PUBLIC_URL", "http://localhost:8182")
 
 app = FastAPI(title="Matter Bridge")
 
-# cache en mémoire, rafraîchi par la boucle de fond
+# cache en mémoire, rafraîchi par refresh_loop() depuis les données déjà
+# en mémoire côté client (maintenues à jour par la connexion permanente)
 _devices_cache: dict[int, dict] = {}
+_client: MatterClient | None = None
 
 
 # --- Mapping "cluster Matter" -> "champ lisible" -------------------------
@@ -80,25 +82,54 @@ def read_node(node) -> dict:
     }
 
 
-async def refresh_loop():
+async def matter_connection_loop():
+    """Maintient une connexion PERMANENTE au Matter server.
+
+    `start_listening()` est une boucle qui tourne indéfiniment pour
+    recevoir les évènements en temps réel (nouvelle valeur de capteur,
+    nouvel appareil commissionné, etc.) — elle ne "revient" jamais tant que
+    la connexion est active. C'est normal : c'est elle qui garde le cache
+    interne du client à jour. On la relance juste si la connexion tombe.
+    """
+    global _client
     while True:
+        session = aiohttp.ClientSession()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with MatterClient(MATTER_SERVER_URL, session) as client:
-                    await client.connect()
-                    await client.start_listening()
-                    nodes = client.get_nodes()
-                    new_cache = {}
-                    for node in nodes:
-                        new_cache[node.node_id] = read_node(node)
-                    _devices_cache.clear()
-                    _devices_cache.update(new_cache)
-                    write_homepage_config(new_cache)
-                    log.info("Rafraîchi %d appareils Matter", len(new_cache))
+            client = MatterClient(MATTER_SERVER_URL, session)
+            await client.connect()
+            _client = client
+            init_ready = asyncio.Event()
+            listen_task = asyncio.create_task(client.start_listening(init_ready))
+            await init_ready.wait()
+            log.info("Connecté au Matter server, écoute des évènements en cours")
+            await listen_task  # bloque tant que la connexion Matter reste ouverte
         except CannotConnect:
             log.warning("Impossible de joindre le Matter server (%s)", MATTER_SERVER_URL)
         except Exception:
-            log.exception("Erreur pendant le rafraîchissement")
+            log.exception("Connexion Matter perdue, nouvelle tentative dans 10s")
+        finally:
+            _client = None
+            await session.close()
+        await asyncio.sleep(10)
+
+
+async def refresh_loop():
+    """Toutes les POLL_INTERVAL secondes : relit le cache déjà tenu à jour
+    par matter_connection_loop() (pas de reconnexion ici) et régénère
+    services.yaml pour Homepage."""
+    while True:
+        if _client is not None:
+            try:
+                nodes = _client.get_nodes()
+                new_cache = {node.node_id: read_node(node) for node in nodes}
+                _devices_cache.clear()
+                _devices_cache.update(new_cache)
+                write_homepage_config(new_cache)
+                log.info("Rafraîchi %d appareils Matter", len(new_cache))
+            except Exception:
+                log.exception("Erreur pendant le rafraîchissement")
+        else:
+            log.debug("Pas encore connecté au Matter server, on attend")
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -142,6 +173,7 @@ def write_homepage_config(devices: dict[int, dict]):
 
 @app.on_event("startup")
 async def startup():
+    asyncio.create_task(matter_connection_loop())
     asyncio.create_task(refresh_loop())
 
 
