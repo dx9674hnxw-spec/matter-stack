@@ -48,7 +48,7 @@ _client: MatterClient | None = None
 # Ajoute ici de nouveaux types de capteurs au fur et à mesure de tes achats.
 CLUSTER_READERS = {
     "TemperatureMeasurement": lambda c: {"temp_c": round(c.measuredValue / 100, 2)},
-    "RelativeHumidity": lambda c: {"humidite_pct": round(c.measuredValue / 100, 2)},
+    "RelativeHumidityMeasurement": lambda c: {"humidite_pct": round(c.measuredValue / 100, 2)},
     "CarbonDioxideConcentrationMeasurement": lambda c: {"co2_ppm": round(c.measuredValue)},
     "Pm25ConcentrationMeasurement": lambda c: {"pm25": round(c.measuredValue, 1)},
     "ElectricalPowerMeasurement": lambda c: {"puissance_w": round(getattr(c, "activePower", 0) / 1000, 2)},
@@ -75,6 +75,11 @@ def read_node(node) -> dict:
                     values.update(reader(cluster))
                 except Exception as exc:  # valeur pas encore lue / cluster vide
                     log.debug("Cluster %s illisible sur node %s: %s", cluster_name, node.node_id, exc)
+            elif cluster_name not in ("BasicInformation", "Descriptor", "PowerSource"):
+                # cluster présent mais pas encore mappé dans CLUSTER_READERS
+                # -> visible dans les logs pour savoir quoi ajouter
+                log.info("Cluster non mappé sur node %s: %s (ajoute-le à CLUSTER_READERS si utile)",
+                         node.node_id, cluster_name)
     return {
         "node_id": node.node_id,
         "name": name or f"Node {node.node_id}",
