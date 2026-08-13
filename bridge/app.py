@@ -19,6 +19,7 @@ regarde `node.endpoints[x].clusters` pour adapter le mapping ci-dessous.
 import asyncio
 import logging
 import os
+import aiohttp
 import yaml
 from fastapi import FastAPI, HTTPException
 from matter_server.client import MatterClient
@@ -82,17 +83,18 @@ def read_node(node) -> dict:
 async def refresh_loop():
     while True:
         try:
-            async with MatterClient(MATTER_SERVER_URL) as client:
-                await client.connect()
-                await client.start_listening()
-                nodes = client.get_nodes()
-                new_cache = {}
-                for node in nodes:
-                    new_cache[node.node_id] = read_node(node)
-                _devices_cache.clear()
-                _devices_cache.update(new_cache)
-                write_homepage_config(new_cache)
-                log.info("Rafraîchi %d appareils Matter", len(new_cache))
+            async with aiohttp.ClientSession() as session:
+                async with MatterClient(MATTER_SERVER_URL, session) as client:
+                    await client.connect()
+                    await client.start_listening()
+                    nodes = client.get_nodes()
+                    new_cache = {}
+                    for node in nodes:
+                        new_cache[node.node_id] = read_node(node)
+                    _devices_cache.clear()
+                    _devices_cache.update(new_cache)
+                    write_homepage_config(new_cache)
+                    log.info("Rafraîchi %d appareils Matter", len(new_cache))
         except CannotConnect:
             log.warning("Impossible de joindre le Matter server (%s)", MATTER_SERVER_URL)
         except Exception:
