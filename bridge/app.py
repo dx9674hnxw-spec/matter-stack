@@ -56,7 +56,7 @@ CLUSTER_READERS = {
         "energie_kwh": round(getattr(c.cumulativeEnergyImported, "energy", 0) / 1_000_000, 3)
         if getattr(c, "cumulativeEnergyImported", None) else None
     },
-    "OnOff": lambda c: {"allume": bool(c.onOff)},
+    "OnOff": lambda c: {"allume": "true" if c.onOff else "false"},
 }
 
 
