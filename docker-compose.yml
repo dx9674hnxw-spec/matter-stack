@@ -20,8 +20,6 @@ services:
       - /srv/homepage:/homepage-config
 
 
-version: "3.8"
-
 services:
   matter-server:
     container_name: matter-server
