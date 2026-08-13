@@ -1,71 +1,20 @@
 version: "3.8"
 
-networks:
-  home:
-    external: false
-
 services:
-
-  # --- Gestion des containers ---
-  portainer:
-    image: portainer/portainer-ce:latest
-    container_name: portainer
-    restart: unless-stopped
-    ports:
-      - "9443:9443"        # UI web (https)
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - portainer_data:/data
-    networks:
-      - home
-
-  # --- Ton dashboard existant ---
-  homepage:
-    image: ghcr.io/gethomepage/homepage:latest
-    container_name: homepage
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      HOMEPAGE_ALLOWED_HOSTS: "*"   # à restreindre à ton domaine/IP en prod
-    volumes:
-      - ./homepage/config:/app/config
-    networks:
-      - home
-
-  # --- Ton serveur Matter existant (celui de la capture "Node 8") ---
-  matter-server:
-    container_name: matter-server
-    image: ghcr.io/home-assistant-libs/python-matter-server:stable
-    restart: unless-stopped
-    security_opt:
-      - apparmor=unconfined
-    network_mode: host          # <-- important : pas sur le réseau "home"
-    volumes:
-      - /opt/matter-server/data:/data:rw
-      - /run/dbus:/run/dbus:ro
-    command: >
-      --storage-path /data
-      --paa-root-cert-dir /data/credentials
-
-  # --- Le "cerveau" : lit le serveur Matter, expose une API générique,
-  #     et régénère automatiquement la config Homepage ---
   matter-bridge:
     build: ./bridge
     container_name: matter-bridge
     restart: unless-stopped
-    depends_on:
-      - matter-server
-    network_mode: host          # <-- même réseau que matter-server -> "localhost" fonctionne
+    # même mode réseau que ton matter-server existant -> "localhost" fonctionne
+    network_mode: host
     environment:
       MATTER_SERVER_URL: "ws://localhost:5580/ws"
+      # on écrit DIRECTEMENT dans le dossier de config déjà utilisé par ton
+      # container "homepage" existant (celui monté sur /srv/homepage)
       HOMEPAGE_OUTPUT_DIR: "/homepage-config"
-      # comme le bridge est en host network, Homepage doit l'appeler via l'IP de l'hôte
+      # adresse par laquelle Homepage (côté Traefik/docker) doit joindre ce
+      # bridge -> ton IP LAN, car matter-bridge est en network_mode host
       BRIDGE_PUBLIC_URL: "http://192.168.1.100:8182"
       POLL_INTERVAL_SECONDS: "30"
     volumes:
-      - ./homepage/config:/homepage-config
-      # port 8182 déjà exposé automatiquement en mode host, pas besoin de "ports:"
-
-volumes:
-  portainer_data:
+      - /srv/homepage:/homepage-config
