@@ -60,9 +60,15 @@ CLUSTER_READERS = {
 }
 
 
-def read_node(node) -> dict:
-    """Extrait toutes les valeurs lisibles d'un node Matter."""
-    values: dict = {}
+def read_node(node, previous_values: dict | None = None) -> dict:
+    """Extrait toutes les valeurs lisibles d'un node Matter.
+
+    `previous_values` : dernières valeurs connues de ce node (cycle
+    précédent). Si une lecture échoue ponctuellement ce cycle-ci (capteur
+    pas encore réveillé, valeur pas encore poussée...), on garde l'ancienne
+    valeur au lieu de faire disparaître le champ du dashboard.
+    """
+    values: dict = dict(previous_values or {})
     name = None
     for endpoint in node.endpoints.values():
         for cluster in endpoint.clusters.values():
@@ -72,7 +78,12 @@ def read_node(node) -> dict:
             reader = CLUSTER_READERS.get(cluster_name)
             if reader:
                 try:
-                    values.update(reader(cluster))
+                    result = reader(cluster)
+                    # on n'écrase une valeur existante que si la nouvelle
+                    # lecture est valide (pas None) -> évite le clignotement
+                    for k, v in result.items():
+                        if v is not None:
+                            values[k] = v
                 except Exception as exc:  # valeur pas encore lue / cluster vide
                     log.debug("Cluster %s illisible sur node %s: %s", cluster_name, node.node_id, exc)
             elif cluster_name not in ("BasicInformation", "Descriptor", "PowerSource"):
@@ -80,6 +91,14 @@ def read_node(node) -> dict:
                 # -> visible dans les logs pour savoir quoi ajouter
                 log.info("Cluster non mappé sur node %s: %s (ajoute-le à CLUSTER_READERS si utile)",
                          node.node_id, cluster_name)
+
+    # "allume" (OnOff) n'a de sens que sur un vrai appareil pilotable
+    # (prise, ampoule...) -> on ne le garde que s'il y a aussi une mesure
+    # de puissance/énergie à côté. Sinon c'est un cluster accessoire (ex:
+    # LED d'un capteur ALPSTUGA) qui n'apporte rien à afficher.
+    if "allume" in values and "puissance_w" not in values and "energie_kwh" not in values:
+        del values["allume"]
+
     return {
         "node_id": node.node_id,
         "name": name or f"Node {node.node_id}",
@@ -126,7 +145,10 @@ async def refresh_loop():
         if _client is not None:
             try:
                 nodes = _client.get_nodes()
-                new_cache = {node.node_id: read_node(node) for node in nodes}
+                new_cache = {}
+                for node in nodes:
+                    previous = _devices_cache.get(node.node_id, {}).get("values")
+                    new_cache[node.node_id] = read_node(node, previous)
                 _devices_cache.clear()
                 _devices_cache.update(new_cache)
                 write_homepage_config(new_cache)
