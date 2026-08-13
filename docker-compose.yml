@@ -20,7 +20,6 @@ services:
       - /srv/homepage:/homepage-config
 
 
-services:
   matter-server:
     container_name: matter-server
     image: ghcr.io/home-assistant-libs/python-matter-server:stable
