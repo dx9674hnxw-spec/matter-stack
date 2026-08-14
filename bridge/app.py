@@ -56,7 +56,19 @@ CLUSTER_READERS = {
         "energie_kwh": round(getattr(c.cumulativeEnergyImported, "energy", 0) / 1_000_000, 3)
         if getattr(c, "cumulativeEnergyImported", None) else None
     },
-    "OnOff": lambda c: {"allume": "true" if c.onOff else "false"},
+    "OnOff": lambda c: {"allume": "ON" if c.onOff else "OFF"},
+}
+
+# --- Libellés affichés sur Homepage (indépendants du nom de champ interne)
+# Modifie ici pour changer ce qui s'affiche sous chaque valeur.
+FIELD_LABELS = {
+    "temp_c": "Temp",
+    "humidite_pct": "Humidité",
+    "co2_ppm": "CO2",
+    "pm25": "PM2.5",
+    "allume": "Status",
+    "puissance_w": "W",
+    "energie_kwh": "kWh",
 }
 
 
@@ -179,7 +191,7 @@ def write_homepage_config(devices: dict[int, dict]):
                     "url": f"{BRIDGE_PUBLIC_URL}/api/devices/{node_id}",
                     "method": "GET",
                     "mappings": [
-                        {"field": f, "label": f, "format": "text"} for f in fields
+                        {"field": f, "label": FIELD_LABELS.get(f, f), "format": "text"} for f in fields
                     ],
                 },
             }
