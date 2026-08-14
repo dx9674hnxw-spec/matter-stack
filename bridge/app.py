@@ -62,8 +62,8 @@ CLUSTER_READERS = {
 # --- Libellés affichés sur Homepage (indépendants du nom de champ interne)
 # Modifie ici pour changer ce qui s'affiche sous chaque valeur.
 FIELD_LABELS = {
-    "temp_c": "Temp",
-    "humidite_pct": "Humidité",
+    "temp_c": "temperature",
+    "humidite_pct": "Humidity",
     "co2_ppm": "CO2",
     "pm25": "PM2.5",
     "allume": "Status",
