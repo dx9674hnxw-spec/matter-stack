@@ -71,6 +71,13 @@ FIELD_LABELS = {
     "energie_kwh": "kWh",
 }
 
+# --- Nom affiché sur Homepage, par node_id (remplace le nom d'usine du
+# capteur). Trouve le node_id de chaque appareil via /api/devices ou dans
+# les logs ("Rafraîchi X appareils Matter" liste les node_id connus).
+DEVICE_NAME_OVERRIDES = {
+    8: "TIMMERFLOTTE Salon",
+}
+
 
 def read_node(node, previous_values: dict | None = None) -> dict:
     """Extrait toutes les valeurs lisibles d'un node Matter.
@@ -111,9 +118,11 @@ def read_node(node, previous_values: dict | None = None) -> dict:
     if "allume" in values and "puissance_w" not in values and "energie_kwh" not in values:
         del values["allume"]
 
+    display_name = DEVICE_NAME_OVERRIDES.get(node.node_id) or name or f"Node {node.node_id}"
+
     return {
         "node_id": node.node_id,
-        "name": name or f"Node {node.node_id}",
+        "name": display_name,
         "values": values,
     }
 
@@ -202,12 +211,23 @@ def write_homepage_config(devices: dict[int, dict]):
 
     manual_path = os.path.join(OUTPUT_DIR, "services.manual.yaml")
     if os.path.exists(manual_path):
-        with open(manual_path) as f:
-            manual_services = yaml.safe_load(f) or []
-        services = manual_services + services
+        try:
+            with open(manual_path) as f:
+                manual_services = yaml.safe_load(f) or []
+            if not isinstance(manual_services, list):
+                raise ValueError("services.manual.yaml doit être une liste de groupes")
+            services = manual_services + services
+        except Exception:
+            log.exception(
+                "services.manual.yaml invalide -> ignoré ce cycle (corrige-le, "
+                "les capteurs Matter restent affichés en attendant)"
+            )
 
-    with open(os.path.join(OUTPUT_DIR, "services.yaml"), "w") as f:
+    final_path = os.path.join(OUTPUT_DIR, "services.yaml")
+    tmp_path = final_path + ".tmp"
+    with open(tmp_path, "w") as f:
         yaml.safe_dump(services, f, allow_unicode=True, sort_keys=False)
+    os.replace(tmp_path, final_path)  # opération atomique -> jamais de fichier à moitié écrit
 
 
 @app.on_event("startup")
