@@ -5,15 +5,10 @@ services:
     build: ./bridge
     container_name: matter-bridge
     restart: unless-stopped
-    # même mode réseau que ton matter-server existant -> "localhost" fonctionne
     network_mode: host
     environment:
       MATTER_SERVER_URL: "ws://localhost:5580/ws"
-      # on écrit DIRECTEMENT dans le dossier de config déjà utilisé par ton
-      # container "homepage" existant (celui monté sur /srv/homepage)
       HOMEPAGE_OUTPUT_DIR: "/homepage-config"
-      # adresse par laquelle Homepage (côté Traefik/docker) doit joindre ce
-      # bridge -> ton IP LAN, car matter-bridge est en network_mode host
       BRIDGE_PUBLIC_URL: "http://192.168.1.100:8182"
       POLL_INTERVAL_SECONDS: "30"
     volumes:
