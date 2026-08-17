@@ -1,0 +1,26 @@
+{
+  "3": {
+    "node_id": 3,
+    "detected_name": "ALPSTUGA air quality monitor",
+    "custom_name": "Qualité air Salon",
+    "device_type": "AirQuality",
+    "first_seen": null,
+    "last_seen": null
+  },
+  "4": {
+    "node_id": 4,
+    "detected_name": "GRILLPLATS Plug",
+    "custom_name": "Prise Grill Terrasse",
+    "device_type": "Plug",
+    "first_seen": null,
+    "last_seen": null
+  },
+  "8": {
+    "node_id": 8,
+    "detected_name": "TIMMERFLOTTE temp/hmd sensor",
+    "custom_name": "TIMMERFLOTTE Salon",
+    "device_type": "TemperatureMeasurement",
+    "first_seen": null,
+    "last_seen": null
+  }
+}
