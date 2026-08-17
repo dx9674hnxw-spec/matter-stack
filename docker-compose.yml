@@ -11,9 +11,11 @@ services:
       HOMEPAGE_OUTPUT_DIR: "/homepage-config"
       BRIDGE_PUBLIC_URL: "http://192.168.1.100:8182"
       POLL_INTERVAL_SECONDS: "30"
+      DEVICE_REGISTRY_FILE: "/config/device_registry.json"
+      STALE_AFTER_SECONDS: "3600"
     volumes:
       - /srv/homepage:/homepage-config
-
+      - /srv/matter-bridge/config:/config
 
   matter-server:
     container_name: matter-server
