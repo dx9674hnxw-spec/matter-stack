@@ -68,7 +68,7 @@ FIELD_LABELS = {
     "pm25": "PM2.5",
     "allume": "Status",
     "puissance_w": "W",
-    "energie_kwh": "kWh",
+    "energie_kwh": "kW/h",
 }
 
 # --- Nom affiché sur Homepage, par node_id (remplace le nom d'usine du
