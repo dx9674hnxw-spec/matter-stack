@@ -7,9 +7,14 @@ seule API générique qui lit TOUS les appareils connus de ton serveur Matter
 
   1. Expose /api/devices           -> liste de tous les appareils + valeurs
   2. Expose /api/devices/{node_id} -> détail d'un appareil
-  3. Régénère automatiquement un fichier services.yaml pour Homepage,
+  3. Expose /api/registry          -> registre persistant node_id <-> noms
+  4. Expose /api/health            -> état de connexion / dernier refresh
+  5. Régénère automatiquement un fichier services.yaml pour Homepage,
      donc plus besoin d'éditer la config Homepage à la main quand tu
      commissionnes un nouveau capteur.
+
+Renommage manuel d'un appareil (sans toucher au code / sans redémarrer) :
+  PUT /api/registry/{node_id}/name   body: {"name": "Capteur CO2 Bureau"}
 
 NOTE: les noms exacts des attributs (measured_value, etc.) dépendent de la
 version de `python-matter-server`. Si un device type n'est pas reconnu,
@@ -17,11 +22,17 @@ regarde `node.endpoints[x].clusters` pour adapter le mapping ci-dessous.
 """
 
 import asyncio
+import json
 import logging
 import os
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from threading import Lock
+
 import aiohttp
 import yaml
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from matter_server.client import MatterClient
 from matter_server.client.exceptions import CannotConnect
 
@@ -30,18 +41,29 @@ log = logging.getLogger("matter-bridge")
 
 MATTER_SERVER_URL = os.environ.get("MATTER_SERVER_URL", "ws://localhost:5580/ws")
 OUTPUT_DIR = os.environ.get("HOMEPAGE_OUTPUT_DIR", "/output")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
+REGISTRY_PATH = os.environ.get("DEVICE_REGISTRY_FILE", "/config/device_registry.json")
+
+_raw_poll = os.environ.get("POLL_INTERVAL_SECONDS", "30")
+try:
+    POLL_INTERVAL = int(_raw_poll)
+except ValueError:
+    log.warning("POLL_INTERVAL_SECONDS=%r invalide, retombe sur 30s", _raw_poll)
+    POLL_INTERVAL = 30
+
+STALE_AFTER_SECONDS = int(os.environ.get("STALE_AFTER_SECONDS", "3600"))
+
 # URL par laquelle Homepage doit joindre CE bridge. En network_mode: host,
 # le nom de service Docker "matter-bridge" n'est plus résolvable : il faut
 # l'IP/host réel (ex: http://192.168.1.100:8182).
 BRIDGE_PUBLIC_URL = os.environ.get("BRIDGE_PUBLIC_URL", "http://localhost:8182")
 
-app = FastAPI(title="Matter Bridge")
-
 # cache en mémoire, rafraîchi par refresh_loop() depuis les données déjà
 # en mémoire côté client (maintenues à jour par la connexion permanente)
 _devices_cache: dict[int, dict] = {}
 _client: MatterClient | None = None
+_registry_lock = Lock()
+_last_refresh_ok: str | None = None
+_background_tasks: list[asyncio.Task] = []
 
 
 # --- Mapping "cluster Matter" -> "champ lisible" -------------------------
@@ -71,12 +93,75 @@ FIELD_LABELS = {
     "energie_kwh": "kW/h",
 }
 
-# --- Nom affiché sur Homepage, par node_id (remplace le nom d'usine du
-# capteur). Trouve le node_id de chaque appareil via /api/devices ou dans
-# les logs ("Rafraîchi X appareils Matter" liste les node_id connus).
-DEVICE_NAME_OVERRIDES = {
-    8: "TIMMERFLOTTE Salon",
+# --- Icônes Homepage par type de mesure présent sur le device ------------
+DEVICE_TYPE_ICONS = {
+    "puissance_w": "mdi-power-plug",
+    "energie_kwh": "mdi-power-plug",
+    "co2_ppm": "mdi-molecule-co2",
+    "pm25": "mdi-air-filter",
+    "humidite_pct": "mdi-water-percent",
+    "temp_c": "mdi-thermometer",
 }
+DEFAULT_ICON = "mdi-chip"
+
+
+def pick_icon(fields: list[str]) -> str:
+    for field in fields:
+        if field in DEVICE_TYPE_ICONS:
+            return DEVICE_TYPE_ICONS[field]
+    return DEFAULT_ICON
+
+
+class RenameRequest(BaseModel):
+    name: str
+
+
+# --- Registre persistant node_id -> noms ---------------------------------
+# Contrairement à un simple dict codé en dur dans le script, ce registre :
+#   - s'auto-remplit avec le nom détecté (nodeLabel/productName) dès qu'un
+#     nouveau capteur est commissionné, sans intervention manuelle
+#   - garde ce nom "détecté" même après avoir fixé un nom personnalisé,
+#     pratique pour retrouver le modèle physique derrière un renommage
+#   - survit aux redémarrages du container car monté en volume
+#   - peut être modifié soit via l'API (PUT /api/registry/{id}/name),
+#     soit à la main dans le fichier JSON (rechargé à chaque cycle)
+
+def load_registry() -> dict[str, dict]:
+    if not os.path.exists(REGISTRY_PATH):
+        return {}
+    try:
+        with open(REGISTRY_PATH) as f:
+            return json.load(f)
+    except Exception:
+        log.exception("device_registry.json invalide -> registre vide ce cycle")
+        return {}
+
+
+def save_registry(registry: dict[str, dict]):
+    os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
+    tmp_path = REGISTRY_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(registry, f, indent=2, ensure_ascii=False, sort_keys=True)
+    os.replace(tmp_path, REGISTRY_PATH)
+
+
+def upsert_registry_entry(registry: dict[str, dict], node_id: int, detected_name: str, device_type: str | None):
+    key = str(node_id)
+    now = datetime.now(timezone.utc).isoformat()
+    if key not in registry:
+        registry[key] = {
+            "node_id": node_id,
+            "detected_name": detected_name,
+            "custom_name": None,
+            "device_type": device_type,
+            "first_seen": now,
+            "last_seen": now,
+        }
+    else:
+        registry[key]["detected_name"] = detected_name
+        registry[key]["device_type"] = device_type
+        registry[key]["last_seen"] = now
+    return registry
 
 
 def read_node(node, previous_values: dict | None = None) -> dict:
@@ -88,14 +173,17 @@ def read_node(node, previous_values: dict | None = None) -> dict:
     valeur au lieu de faire disparaître le champ du dashboard.
     """
     values: dict = dict(previous_values or {})
-    name = None
+    detected_name = None
+    device_type = None
     for endpoint in node.endpoints.values():
         for cluster in endpoint.clusters.values():
             cluster_name = type(cluster).__name__
             if cluster_name == "BasicInformation":
-                name = getattr(cluster, "nodeLabel", None) or getattr(cluster, "productName", None)
+                detected_name = getattr(cluster, "nodeLabel", None) or getattr(cluster, "productName", None)
             reader = CLUSTER_READERS.get(cluster_name)
             if reader:
+                if device_type is None:
+                    device_type = cluster_name
                 try:
                     result = reader(cluster)
                     # on n'écrase une valeur existante que si la nouvelle
@@ -118,11 +206,10 @@ def read_node(node, previous_values: dict | None = None) -> dict:
     if "allume" in values and "puissance_w" not in values and "energie_kwh" not in values:
         del values["allume"]
 
-    display_name = DEVICE_NAME_OVERRIDES.get(node.node_id) or name or f"Node {node.node_id}"
-
     return {
         "node_id": node.node_id,
-        "name": display_name,
+        "detected_name": detected_name,
+        "device_type": device_type,
         "values": values,
     }
 
@@ -160,19 +247,36 @@ async def matter_connection_loop():
 
 async def refresh_loop():
     """Toutes les POLL_INTERVAL secondes : relit le cache déjà tenu à jour
-    par matter_connection_loop() (pas de reconnexion ici) et régénère
-    services.yaml pour Homepage."""
+    par matter_connection_loop() (pas de reconnexion ici), fusionne avec le
+    registre de noms persistant, et régénère services.yaml pour Homepage."""
+    global _last_refresh_ok
     while True:
-        if _client is not None:
+        client = _client
+        if client is not None:
             try:
-                nodes = _client.get_nodes()
+                nodes = client.get_nodes()
                 new_cache = {}
-                for node in nodes:
-                    previous = _devices_cache.get(node.node_id, {}).get("values")
-                    new_cache[node.node_id] = read_node(node, previous)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                with _registry_lock:
+                    registry = load_registry()
+                    for node in nodes:
+                        previous = _devices_cache.get(node.node_id, {}).get("values")
+                        info = read_node(node, previous)
+                        detected = info["detected_name"] or f"Node {node.node_id}"
+                        registry = upsert_registry_entry(registry, node.node_id, detected, info["device_type"])
+                        entry = registry[str(node.node_id)]
+                        display_name = entry.get("custom_name") or entry["detected_name"]
+                        new_cache[node.node_id] = {
+                            "node_id": node.node_id,
+                            "name": display_name,
+                            "values": info["values"],
+                            "last_seen": now_iso,
+                        }
+                    save_registry(registry)
                 _devices_cache.clear()
                 _devices_cache.update(new_cache)
                 write_homepage_config(new_cache)
+                _last_refresh_ok = now_iso
                 log.info("Rafraîchi %d appareils Matter", len(new_cache))
             except Exception:
                 log.exception("Erreur pendant le rafraîchissement")
@@ -194,7 +298,7 @@ def write_homepage_config(devices: dict[int, dict]):
             continue
         entry = {
             dev["name"]: {
-                "icon": "mdi-thermometer",
+                "icon": pick_icon(fields),
                 "widget": {
                     "type": "customapi",
                     "url": f"{BRIDGE_PUBLIC_URL}/api/devices/{node_id}",
@@ -226,14 +330,22 @@ def write_homepage_config(devices: dict[int, dict]):
     final_path = os.path.join(OUTPUT_DIR, "services.yaml")
     tmp_path = final_path + ".tmp"
     with open(tmp_path, "w") as f:
-        yaml.safe_dump(services, f, allow_unicode=True, sort_keys=False)
+        yaml.safe_dump(services, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
     os.replace(tmp_path, final_path)  # opération atomique -> jamais de fichier à moitié écrit
 
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(matter_connection_loop())
-    asyncio.create_task(refresh_loop())
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    conn_task = asyncio.create_task(matter_connection_loop())
+    refresh_task = asyncio.create_task(refresh_loop())
+    _background_tasks.extend([conn_task, refresh_task])
+    yield
+    for task in _background_tasks:
+        task.cancel()
+    await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+
+app = FastAPI(title="Matter Bridge", lifespan=lifespan)
 
 
 @app.get("/api/devices")
@@ -247,3 +359,45 @@ async def get_device(node_id: int):
     if not dev:
         raise HTTPException(status_code=404, detail="Appareil inconnu")
     return dev["values"]
+
+
+@app.get("/api/registry")
+async def get_registry():
+    """Liste tous les node_id déjà vus, avec leur nom détecté et leur nom
+    personnalisé (si défini). Pratique pour retrouver le node_id d'un
+    capteur physique avant de le renommer."""
+    with _registry_lock:
+        return load_registry()
+
+
+@app.put("/api/registry/{node_id}/name")
+async def set_custom_name(node_id: int, req: RenameRequest):
+    """Fixe un nom personnalisé pour ce node_id, appliqué immédiatement
+    (cache + prochaine génération de services.yaml) sans redémarrage."""
+    with _registry_lock:
+        registry = load_registry()
+        key = str(node_id)
+        if key not in registry:
+            raise HTTPException(status_code=404, detail="Node jamais vu, attends le prochain cycle de refresh")
+        registry[key]["custom_name"] = req.name
+        save_registry(registry)
+    if node_id in _devices_cache:
+        _devices_cache[node_id]["name"] = req.name
+    return registry[key]
+
+
+@app.get("/api/health")
+async def health():
+    """État de connexion Matter, nombre d'appareils en cache, et
+    horodatage du dernier refresh réussi -> utile pour ton monitoring."""
+    now = datetime.now(timezone.utc)
+    stale = False
+    if _last_refresh_ok is not None:
+        last = datetime.fromisoformat(_last_refresh_ok)
+        stale = (now - last).total_seconds() > STALE_AFTER_SECONDS
+    return {
+        "matter_connected": _client is not None,
+        "devices_count": len(_devices_cache),
+        "last_refresh_ok": _last_refresh_ok,
+        "stale": stale,
+    }
